@@ -8,32 +8,45 @@ from time import perf_counter
 
 import torch
 
-from arch import CV, FC, FixedAngles, FixedWeights, Wide_ResNet, Conv1d
+from arch import CV, FC, FixedAngles, FixedWeights, FixedBetas, FixedNorm, Wide_ResNet, Conv1d, CrownInit, MFAngles
+from arch.fc import LinearNetwork
+from arch.fa2 import LinearFANetwork
 from arch.mnas import MnasNetLike, MNISTNet
 from arch.swish import swish
 from dataset import get_binary_dataset
 from dynamics import train_kernel, train_regular, loglinspace
 from kernels import compute_kernels, kernel_intdim, eigenvectors
 
+import numpy as np
 
-def loss_func(args, f, y):
+def loss_func(args, o, y):
     if args.loss == 'hinge':
-        return (args.loss_margin - args.alpha * f * y).relu() / args.alpha
+        return (args.loss_margin - args.alpha * o * y).relu() / args.alpha ** args.loss_over_alpha_power
     if args.loss == 'softhinge':
         sp = partial(torch.nn.functional.softplus, beta=args.loss_beta)
-        return sp(args.loss_margin - args.alpha * f * y) / args.alpha
+        return sp(args.loss_margin - args.alpha * o * y) / args.alpha ** args.loss_over_alpha_power
     if args.loss == 'qhinge':
-        return 0.5 * (args.loss_margin - args.alpha * f * y).relu().pow(2) / args.alpha
+        return 0.5 * (args.loss_margin - args.alpha * o * y).relu().pow(2) / args.alpha ** args.loss_over_alpha_power
+    if args.loss == 'linear':
+        return (args.loss_margin - args.alpha * o * y) / args.alpha ** args.loss_over_alpha_power
+    if args.loss == 'hinge_pt':
+        # Divide by true p(t) the loss instead of total p. Should speed-up dynamics towards the end
+        # add a rescaling to test loss
+        pt = (args.alpha * o * y < args.loss_margin).sum()
+        return (args.loss_margin - args.alpha * o * y).relu() / args.alpha ** args.loss_over_alpha_power * (args.ptr / pt)
 
 
 def loss_func_prime(args, f, y):
     if args.loss == 'hinge':
-        return -((args.loss_margin - args.alpha * f * y) > 0).double() * y
+        return -((args.loss_margin - args.alpha * f * y) > 0).double() * y / args.alpha ** (args.loss_over_alpha_power - 1)
     if args.loss == 'softhinge':
-        return -torch.sigmoid(args.loss_beta * (args.loss_margin - args.alpha * f * y)) * y
+        return -torch.sigmoid(args.loss_beta * (args.loss_margin - args.alpha * f * y)) * y / args.alpha ** (args.loss_over_alpha_power - 1)
     if args.loss == 'qhinge':
-        return -(args.loss_margin - args.alpha * f * y).relu() * y
-
+        return -(args.loss_margin - args.alpha * f * y).relu() * y / args.alpha ** (args.loss_over_alpha_power - 1)
+    if args.loss == 'linear':
+        return - y.double() / args.alpha ** (args.loss_over_alpha_power - 1)
+    if args.loss == 'hinge_L2':
+        raise NotImplementedError
 
 class SplitEval(torch.nn.Module):
     def __init__(self, f, size):
@@ -95,7 +108,7 @@ def run_kernel(prefix, args, ktrtr, ktetr, ktete, xtr, ytr, xte, yte):
             'loss': loss_func(args, otr, ytr).mean().item(),
             'aloss': args.alpha * loss_func(args, otr, ytr).mean().item(),
             'err': (otr * ytr <= 0).double().mean().item(),
-            'nd': (args.alpha * otr * ytr < args.stop_margin).long().sum().item(),
+            'nd': (args.alpha * otr * ytr < args.loss_margin).long().sum().item(),
             'mind': (args.alpha * otr * ytr).min().item(),
             'maxd': (args.alpha * otr * ytr).max().item(),
             'dfnorm': otr.pow(2).mean().sqrt().item(),
@@ -115,7 +128,7 @@ def run_kernel(prefix, args, ktrtr, ktetr, ktete, xtr, ytr, xte, yte):
             'loss': loss_func(args, ote, yte).mean().item(),
             'aloss': args.alpha * loss_func(args, ote, yte).mean().item(),
             'err': (ote * yte <= 0).double().mean().item(),
-            'nd': (args.alpha * ote * yte < args.stop_margin).long().sum().item(),
+            'nd': (args.alpha * ote * yte < args.loss_margin).long().sum().item(),
             'mind': (args.alpha * ote * yte).min().item(),
             'maxd': (args.alpha * ote * yte).max().item(),
             'dfnorm': ote.pow(2).mean().sqrt().item(),
@@ -127,6 +140,9 @@ def run_kernel(prefix, args, ktrtr, ktetr, ktete, xtr, ytr, xte, yte):
                " [train aL={d[train][aloss]:.2e} err={d[train][err]:.2f} nd={d[train][nd]}/{ptr} mind={d[train][mind]:.3f}]" + \
                " [test aL={d[test][aloss]:.2e} err={d[test][err]:.2f}]").format(prefix=prefix, d=state, ptr=len(xtr), pte=len(xte)), flush=True)
         dynamics.append(state)
+
+        if (args.ptr - state["train"]["nd"]) / args.ptr > args.stop_frac:
+            stop = True
 
         out = {
             'dynamics': dynamics,
@@ -184,8 +200,9 @@ def run_regular(args, f0, xtr, ytr, xte, yte):
 
     wall = perf_counter()
     dynamics = []
+
     for state, f, otr, _otr0, grad, _bi in train_regular(f0, xtr, ytr, tau,
-                                                         partial(loss_func, args), bool(args.f0),
+                                                         partial(loss_func, args), args.l2_decay, bool(args.f0),
                                                          args.chunk, args.bs, args.max_dgrad, args.max_dout / args.alpha):
         save_outputs = args.save_outputs
         save = stop = False
@@ -250,10 +267,10 @@ def run_regular(args, f0, xtr, ytr, xte, yte):
                 return torch.cat(list(getattr(f.f, "W{}".format(i))))
             state['wnorm'] = [getw(f, i).norm().item() for i in range(f.f.L + 1)]
             state['dwnorm'] = [(getw(f, i) - getw(f0, i)).norm().item() for i in range(f.f.L + 1)]
+            W = [getw(f, i) for i in range(2)]
+            W0 = [getw(f0, i) for i in range(2)]
             if args.save_weights:
                 assert args.L == 1
-                W = [getw(f, i) for i in range(2)]
-                W0 = [getw(f0, i) for i in range(2)]
                 state['w'] = [W[0][:, j].pow(2).mean().sqrt().item() for j in range(args.d)]
                 state['dw'] = [(W[0][:, j] - W0[0][:, j]).pow(2).mean().sqrt().item() for j in range(args.d)]
                 state['beta'] = W[1].pow(2).mean().sqrt().item()
@@ -263,13 +280,26 @@ def run_regular(args, f0, xtr, ytr, xte, yte):
                     B0 = getattr(f0.f, "B0")
                     state['b'] = B.pow(2).mean().sqrt().item()
                     state['db'] = (B - B0).pow(2).mean().sqrt().item()
+            if stop or args.save_attractors > 0:
+                sign_on_xtr = (xtr @ (W[0].t() / xtr.size(1) ** 0.5) + B).sign()
+                unique_attractors = np.unique(sign_on_xtr.detach().cpu().numpy(), axis=1, return_counts=True)[1]
+                state['attractors _number'] = unique_attractors.shape[0]
+                if args.save_attractors > 1:
+                    state['attractors_degeneracy'] = unique_attractors
+                    
+        if stop or args.save_state == 1:
+            state['state'] = copy.deepcopy(f.state_dict())
+        else:
+            state['state'] = None
 
-        state['state'] = copy.deepcopy(f.state_dict()) if save_outputs and (args.save_state == 1) else None
+        if args.fa != 'backprop':
+            state['weight_fa'] = [l.weight_fa for l in f.f.linear]
+
         state['train'] = {
             'loss': loss_func(args, otr, ytr).mean().item(),
             'aloss': args.alpha * loss_func(args, otr, ytr).mean().item(),
             'err': (otr * ytr <= 0).double().mean().item(),
-            'nd': (args.alpha * otr * ytr < args.stop_margin).long().sum().item(),
+            'nd': (args.alpha * otr * ytr < args.loss_margin).long().sum().item(),
             'mind': (args.alpha * otr * ytr).min().item(),
             'maxd': (args.alpha * otr * ytr).max().item(),
             'dfnorm': otr.pow(2).mean().sqrt(),
@@ -281,7 +311,7 @@ def run_regular(args, f0, xtr, ytr, xte, yte):
             'loss': loss_func(args, ote, yte).mean().item(),
             'aloss': args.alpha * loss_func(args, ote, yte).mean().item(),
             'err': test_err,
-            'nd': (args.alpha * ote * yte < args.stop_margin).long().sum().item(),
+            'nd': (args.alpha * ote * yte < args.loss_margin).long().sum().item(),
             'mind': (args.alpha * ote * yte).min().item(),
             'maxd': (args.alpha * ote * yte).max().item(),
             'dfnorm': ote.pow(2).mean().sqrt(),
@@ -299,14 +329,20 @@ def run_regular(args, f0, xtr, ytr, xte, yte):
             ).format(d=state, p=len(ytr)),
             flush=True
         )
+
+        if (args.ptr - state["train"]["nd"]) / args.ptr > args.stop_frac:
+            stop = True
+
+        if stop:
+            state['test']['outputs'] = ote
+            state['test']['labels'] = yte
+            state['state'] = copy.deepcopy(f.state_dict())
+
         dynamics.append(state)
 
         out = {
             'dynamics': dynamics,
         }
-
-        if (args.ptr - state["train"]["nd"]) / args.ptr > args.stop_frac:
-            stop = True
 
         yield f, out
         if stop:
@@ -375,11 +411,11 @@ def run_exp(args, f0, xtr, ytr, xtk, ytk, xte, yte):
                         out['dynamics'][-1]['features_ptr'] = kout
                     del running_kernel
 
-                out['dynamics'][-1]['state'] = copy.deepcopy(f.state_dict())
+                # out['dynamics'][-1]['state'] = copy.deepcopy(f.state_dict())
 
                 try:
                     al = next(it)
-                except StopIteration:
+                except:
                     al = 0
 
             if perf_counter() - wall > 120:
@@ -550,6 +586,17 @@ def init(args):
         xte = xte.flatten(1)
         f = FC(xtr.size(1), args.h, 1, args.L, act, args.bias, args.last_bias, args.var_bias)
 
+    elif args.arch == 'fc_fa':
+        assert args.L is not None
+        xtr = xtr.flatten(1)
+        xtk = xtk.flatten(1)
+        xte = xte.flatten(1)
+        # f = FC_fa(xtr.size(1), args.h, 1, args.L, act, args.bias, args.last_bias, args.fa)
+        if args.fa == 'backprop':
+            f = LinearNetwork(xtr.size(1), args.h, act, args.bias)
+        else:
+            f = LinearFANetwork(xtr.size(1), args.h, act, args.bias, args.fa)
+
     elif args.arch == 'cv':
         assert args.bias == 0
         f = CV(xtr.size(1), args.h, L1=args.cv_L1, L2=args.cv_L2, act=act, h_base=args.cv_h_base,
@@ -563,10 +610,18 @@ def init(args):
     elif args.arch == 'mnist':
         assert args.dataset == 'mnist'
         f = MNISTNet(xtr.size(1), args.h, 1, act)
+    elif args.arch == 'crown_init':
+        f = CrownInit(args.d, args.h, act, args.bias)
     elif args.arch == 'fixed_weights':
         f = FixedWeights(args.d, args.h, act, args.bias)
     elif args.arch == 'fixed_angles':
         f = FixedAngles(args.d, args.h, act, args.bias)
+    elif args.arch == 'fixed_betas':
+        f = FixedBetas(args.d, args.h, act, args.bias)
+    elif args.arch == 'fixed_norm':
+        f = FixedNorm(args.d, args.h, act, args.bias)
+    elif args.arch == 'mf_angles':
+        f = MFAngles(args.d, args.h, act, args.bias)
     elif args.arch == 'conv1d':
         f = Conv1d(args.d, args.h, act, args.bias)
     else:
@@ -625,7 +680,7 @@ def main():
     parser.add_argument("--act_beta", type=float, default=1.0)
     parser.add_argument("--bias", type=float, default=0)
     parser.add_argument("--last_bias", type=float, default=0)
-    parser.add_argument("--var_bias", type=float, default=0)
+    parser.add_argument("--var_bias", type=float, default=1)
     parser.add_argument("--L", type=int)
     parser.add_argument("--h", type=int, required=True)
     parser.add_argument("--mix_angle", type=float, default=45)
@@ -635,6 +690,8 @@ def main():
     parser.add_argument("--cv_fsz", type=int, default=5)
     parser.add_argument("--cv_pad", type=int, default=1)
     parser.add_argument("--cv_stride_first", type=int, default=1)
+
+    parser.add_argument("--fa", type=str, default="backprop")
 
     parser.add_argument("--init_kernel", type=int, default=0)
     parser.add_argument("--init_kernel_ptr", type=int, default=0)
@@ -655,8 +712,13 @@ def main():
     parser.add_argument("--save_outputs", type=int, default=0)
     parser.add_argument("--save_state", type=int, default=0)
     parser.add_argument("--save_weights", type=int, default=0)
-
+    parser.add_argument("--save_attractors", type=int, default=0,
+                        help = "If 1, saves the number of attractors at each step."
+                               " If 2, saves also the degeneracy of each."
+                       )
+    
     parser.add_argument("--alpha", type=float, required=True)
+    parser.add_argument("--loss_over_alpha_power", type=int, default=1, help="Divide the loss by alpha ^ *")
     parser.add_argument("--f0", type=int, default=1)
 
     parser.add_argument("--tau_over_h", type=float, default=0.0)
@@ -672,6 +734,7 @@ def main():
 
     parser.add_argument("--loss", type=str, default="softhinge")
     parser.add_argument("--loss_beta", type=float, default=20.0)
+    parser.add_argument("--l2_decay", type=float, default=0.)
     parser.add_argument("--loss_margin", type=float, default=1.0)
     parser.add_argument("--stop_margin", type=float, default=1.0)
     parser.add_argument("--stop_frac", type=float, default=1.0)
