@@ -7,11 +7,13 @@ Defines three architectures:
 """
 import functools
 import math
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from fa_wrapper import FA_wrapper
 
 class FC(nn.Module):
     def __init__(self, d, h, c, L, act, bias=False, last_bias=False, var_bias=0):
@@ -66,6 +68,29 @@ class FC(nn.Module):
         return x
 
 
+class CrownInit(nn.Module):
+    def __init__(self, d, h, act, bias, A=1.5, B=.5):
+        super().__init__()
+
+
+        self.B = nn.Parameter((torch.rand(h) * A + B) * torch.randn(h).sign())
+        self.W = nn.Parameter((torch.rand(h) * A + B) * torch.randn(h).sign())
+
+        r = torch.rand(h) * A + B
+        theta = torch.randn(h) * 2 * math.pi
+
+        self.W0 = nn.Parameter(torch.cat([(r * theta.cos()).reshape(-1, 1), (r * theta.sin()).reshape(-1, 1)], dim=1))
+
+        self.act = act
+        self.bias = bias
+
+    def forward(self, x):
+        d = x.size(1)
+        B = self.bias * self.B
+        h = len(B)
+        return self.act(x @ (self.W0.T / d**0.5) + B) @ (self.W / h)
+
+
 class FixedWeights(nn.Module):
     def __init__(self, d, h, act, bias):
         super().__init__()
@@ -73,6 +98,24 @@ class FixedWeights(nn.Module):
         self.register_buffer("W0", torch.randn(h, d))
         self.B = nn.Parameter(torch.zeros(h))
         self.W = nn.Parameter(torch.randn(h))
+
+        self.act = act
+        self.bias = bias
+
+    def forward(self, x):
+        d = x.size(1)
+        B = self.bias * self.B
+        h = len(B)
+        return self.act(x @ (self.W0.T / d**0.5) + B) @ (self.W / h)
+
+
+class FixedBetas(nn.Module):
+    def __init__(self, d, h, act, bias):
+        super().__init__()
+
+        self.W0 = nn.Parameter(torch.randn(h, d))
+        self.B = nn.Parameter(torch.zeros(h))
+        self.register_buffer("W", torch.randn(h))
 
         self.act = act
         self.bias = bias
@@ -105,6 +148,58 @@ class FixedAngles(nn.Module):
         return self.act(x @ ((self.r * self.W0).T / d**0.5) + B) @ (self.W / h)
 
 
+class FixedNorm(nn.Module):
+    def __init__(self, d, h, act, bias):
+        super().__init__()
+
+        W0 = torch.randn(h, d)
+        r = W0.norm(dim=1, keepdim=True)
+        self.W0 = nn.Parameter(W0 / r)
+        self.register_buffer("r", r)
+        self.register_buffer("B", torch.randn(h))
+        self.B = nn.Parameter(torch.zeros(h))
+        self.W = nn.Parameter(torch.randn(h))
+
+        self.act = act
+        self.bias = bias
+
+    def forward(self, x):
+        d = x.size(1)
+        B = self.bias * self.B
+        h = len(B)
+        return self.act(x @ ((self.r * self.W0).T / d**0.5) + B) @ (self.W / h)
+
+
+class MFAngles(nn.Module):
+    """Not working for the moment."""
+    def __init__(self, d, h, act, bias, ni=1000):
+        super().__init__()
+
+        r = torch.randn(h, d).norm(dim=1)
+        self.r = nn.Parameter(r)
+        self.B = nn.Parameter(torch.randn(h))
+        self.W = nn.Parameter(torch.randn(h))
+        self.register_buffer("phi", torch.linspace(-math.pi, math.pi, ni))
+        self.act = act
+        self.bias = bias
+
+    def forward(self, x):
+        d = x.size(1)
+        B = self.bias * self.B
+        h = len(B)
+
+        xn = x.norm(dim=1)
+
+        if d == 2:
+            a = (- d ** .5 / torch.einsum('i,k->ki', self.r / B, xn)).clamp(-1, 1).acos()
+            integral = torch.einsum('i,k,ki->ki', self.r, xn, a.sin()) + 2 ** .5 * a * B
+            return integral @ (self.W * 2 ** .5 / h)
+        else:
+            integrand = self.act(torch.einsum('p,h,n->phn', x.norm(dim=1), self.r, self.phi.cos()) /
+                                 d ** 0.5 + B.reshape(1, -1, 1)) * self.phi.sin().pow(d - 2)
+            return torch.trapz(integrand, self.phi) @ (self.W / h)
+
+
 class Conv1d(nn.Module):
     def __init__(self, d, h, act, bias):
         super().__init__()
@@ -122,7 +217,7 @@ class Conv1d(nn.Module):
         h = len(B)
         x = torch.cat((x, x[:, :-1]), dim=1)
         x = x.reshape(x.size(0), 1, d + d - 1)
-        return (self.act(F.conv1d(x, self.W / d**0.5, B)).sum(dim=2) / d) @ (self.C / h)
+        return (self.act(F.conv1d(x, self.W / d ** .5, B)).sum(dim=2) / d) @ (self.C / h)
 
 
 class CV(nn.Module):
