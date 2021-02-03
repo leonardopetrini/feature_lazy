@@ -108,6 +108,14 @@ def get_normalized_dataset(dataset, ps, seeds, d=0, params=None):
         x = center_normalize(x)
         return intertwine_split(x, y, i, ps, seeds, y.unique())
 
+    if dataset == "mnist_pca":
+        tr = torchvision.datasets.MNIST('~/.torchvision/datasets/MNIST', train=True, download=True, transform=transform)
+        te = torchvision.datasets.MNIST('~/.torchvision/datasets/MNIST', train=False, transform=transform)
+        x, y, i = intertwine_labels(*dataset_to_tensors(list(tr) + list(te)))
+        x = center_normalize(x)
+        x = pca(x, d, whitening=True)
+        return intertwine_split(x, y, i, ps, seeds, y.unique())
+
     if dataset == "kmnist":
         tr = torchvision.datasets.KMNIST('~/.torchvision/datasets/KMNIST', train=True, download=True, transform=transform)
         te = torchvision.datasets.KMNIST('~/.torchvision/datasets/KMNIST', train=False, transform=transform)
@@ -180,7 +188,20 @@ def get_normalized_dataset(dataset, ps, seeds, d=0, params=None):
             y = (x[:, 0] > -0.3) * (x[:, 0] < 1.18549)
         if dataset == 'sphere':
             r = x.norm(dim=1)
-            y = r**2 > d * (1 - 2 / (9 * d))**3
+            # y = r**2 > d * (1 - 2 / (9 * d))**3
+            y = r ** 2 > (d - (2 - 2 ** .5))
+        if dataset == 'sphere_crown':
+            R = (d * (1 - 2 / (9 * d))**3) ** .5
+            r = x.norm(dim=1)
+            x *= R / r.view(-1, 1)
+            x += torch.randn(*x.shape) / 100
+            y = r**2 > R
+        if dataset == 'sphere_unif':
+            u = torch.randn(p,d)
+            norm = u.norm(dim=1, keepdim=True)
+            r = (torch.rand(p,1) * 2).pow(1/d)
+            x = r * u / norm
+            y = r[:, 0] > 1 + 1 / (5 * d) # have slightly unbalanced classes
         if dataset == 'cylinder':
             dsph = int(params[0])
             stretching = params[1]
@@ -236,6 +257,73 @@ def get_normalized_dataset(dataset, ps, seeds, d=0, params=None):
             for k in range(1, n0+1):
                 x += (a[:, k-1].mul((k * r).cos()) + b[:, k-1].mul((k * r).sin())).T
             y = 2 / d * F.conv1d(torch.cat((x, x[:, :-1]), dim=1).reshape(p, 1, -1), psi).max(dim=2).values.reshape(-1) - C0 > 0
+
+        if dataset == 'compositional':
+            pattern_size = 3
+            p1 = torch.zeros(pattern_size, pattern_size)
+            p2 = torch.zeros(pattern_size, pattern_size)
+            p3 = torch.zeros(pattern_size, pattern_size)
+            for ii in range(pattern_size):
+                for jj in range(pattern_size):
+                    if ii == jj:
+                        p1[ii, jj] = 1
+                    if ii == (2 - j):
+                        p2[ii, jj] = 1
+                    if (ii, jj) in [(0, 0), (2, 0), (1, 2)]:
+                        p3[ii, jj] = 1
+
+            noise_intensity = 1/7
+            x = torch.randn(p, d, d) * noise_intensity
+            y = torch.zeros(p)
+            y[:p // 3] = 0
+            y[p // 3:p // 3 * 2] = 1
+            y[p // 3 * 2:p] = 2
+
+            for pi in range(p // 3):
+                intensity = torch.rand(1)[0] + 0.3
+
+                ip = torch.randperm(d - ps)[0]
+                jp = torch.randperm(d - ps)[0]
+
+                x[pi, ip:(ip + 3), jp:jp + 3] += p1 * intensity
+
+                ip = torch.randperm(d - ps)[0]
+                jp = torch.randperm(d - ps)[0]
+
+                x[pi, ip:(ip + 3), jp:jp + 3] += p2 * intensity
+
+            for pi in range(p // 3, p // 3 * 2):
+                intensity = torch.rand(1)[0] + 0.3
+
+                ip = torch.randperm(d - ps)[0]
+                jp = torch.randperm(d - ps)[0]
+
+                x[pi, ip:(ip + 3), jp:jp + 3] += p1 * intensity
+
+                ip = torch.randperm(d - ps)[0]
+                jp = torch.randperm(d - ps)[0]
+
+                x[pi, ip:(ip + 3), jp:jp + 3] += p3 * intensity
+
+            for pi in range(p // 3 * 2, p):
+                intensity = torch.rand(1)[0] + 0.3
+
+                ip = torch.randperm(d - ps)[0]
+                jp = torch.randperm(d - ps)[0]
+
+                x[pi, ip:(ip + 3), jp:jp + 3] += p2 * intensity
+
+                ip = torch.randperm(d - ps)[0]
+                jp = torch.randperm(d - ps)[0]
+
+                x[pi, ip:(ip + 3), jp:jp + 3] += p3 * intensity
+
+            for i in range(p // 3, p // 3 + 5):
+                plt.subplot(1, 5, i + 1 - p // 3)
+                plt.imshow(x[i])
+
+            return x.reshape(p, 1, d, d), y.long()
+
         y = y.to(dtype=torch.long)
         out += [(x, y, None)]
     return out
