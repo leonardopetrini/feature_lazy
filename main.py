@@ -201,6 +201,17 @@ def run_regular(args, f0, xtr, ytr, xte, yte):
     wall = perf_counter()
     dynamics = []
 
+    if args.save_state_wrt_loss:
+        loss_it = iter(args.save_state_wrt_loss)
+        loss_frac = next(loss_it)
+    else:
+        loss_frac = -1
+    if args.save_state_wrt_terr:
+        terr_it = iter(args.save_state_wrt_terr)
+        terr_frac = next(terr_it)
+    else:
+        terr_frac = -1
+
     for state, f, otr, _otr0, grad, _bi in train_regular(f0, xtr, ytr, tau,
                                                          partial(loss_func, args), args.l2_decay, bool(args.f0),
                                                          args.chunk, args.bs, args.max_dgrad, args.max_dout / args.alpha):
@@ -269,6 +280,9 @@ def run_regular(args, f0, xtr, ytr, xte, yte):
             state['dwnorm'] = [(getw(f, i) - getw(f0, i)).norm().item() for i in range(f.f.L + 1)]
             W = [getw(f, i) for i in range(2)]
             W0 = [getw(f0, i) for i in range(2)]
+            if args.bias:
+                B = getattr(f.f, "B0")
+                B0 = getattr(f0.f, "B0")
             if args.save_weights:
                 assert args.L == 1
                 state['w'] = [W[0][:, j].pow(2).mean().sqrt().item() for j in range(args.d)]
@@ -276,8 +290,6 @@ def run_regular(args, f0, xtr, ytr, xte, yte):
                 state['beta'] = W[1].pow(2).mean().sqrt().item()
                 state['dbeta'] = (W[1] - W0[1]).pow(2).mean().sqrt().item()
                 if args.bias:
-                    B = getattr(f.f, "B0")
-                    B0 = getattr(f0.f, "B0")
                     state['b'] = B.pow(2).mean().sqrt().item()
                     state['db'] = (B - B0).pow(2).mean().sqrt().item()
             if stop or args.save_attractors > 0:
@@ -286,11 +298,6 @@ def run_regular(args, f0, xtr, ytr, xte, yte):
                 state['attractors _number'] = unique_attractors.shape[0]
                 if args.save_attractors > 1:
                     state['attractors_degeneracy'] = unique_attractors
-                    
-        if stop or args.save_state == 1:
-            state['state'] = copy.deepcopy(f.state_dict())
-        else:
-            state['state'] = None
 
         if args.fa != 'backprop':
             state['weight_fa'] = [l.weight_fa for l in f.f.linear]
@@ -329,6 +336,23 @@ def run_regular(args, f0, xtr, ytr, xte, yte):
             ).format(d=state, p=len(ytr)),
             flush=True
         )
+
+        state['state'] = None
+        if len(dynamics) > 0:
+            loss_flag = state['train']['aloss'] < loss_frac * dynamics[0]['train']['aloss']
+            terr_flag = state['test']['err'] < terr_frac * dynamics[0]['test']['err']
+            if args.save_state == 1 or loss_flag or terr_flag:
+                state['state'] = copy.deepcopy(f.state_dict())
+            if loss_flag:
+                try:
+                    loss_frac = next(loss_it)
+                except StopIteration:
+                    loss_frac = 0
+            if terr_flag:
+                try:
+                    terr_frac = next(terr_it)
+                except StopIteration:
+                    terr_frac = 0
 
         if (args.ptr - state["train"]["nd"]) / args.ptr > args.stop_frac:
             stop = True
@@ -415,7 +439,7 @@ def run_exp(args, f0, xtr, ytr, xtk, ytk, xte, yte):
 
                 try:
                     al = next(it)
-                except:
+                except StopIteration:
                     al = 0
 
             if perf_counter() - wall > 120:
@@ -710,13 +734,16 @@ def main():
     parser.add_argument("--stretch_kernel", type=int, default=0)
 
     parser.add_argument("--save_outputs", type=int, default=0)
-    parser.add_argument("--save_state", type=int, default=0)
+    parser.add_argument("--save_state", type=int, default=0, help="Save all the weights of the net depending on ckpt.")
     parser.add_argument("--save_weights", type=int, default=0)
     parser.add_argument("--save_attractors", type=int, default=0,
                         help = "If 1, saves the number of attractors at each step."
                                " If 2, saves also the degeneracy of each."
                        )
-    
+    parser.add_argument('--save_state_wrt_loss', nargs='+', type=float, help="Frac. of tr. loss where to save state.")
+    parser.add_argument('--save_state_wrt_terr', nargs='+', type=float, help="Frac. of te. err. where to save state.")
+
+
     parser.add_argument("--alpha", type=float, required=True)
     parser.add_argument("--loss_over_alpha_power", type=int, default=1, help="Divide the loss by alpha ^ *")
     parser.add_argument("--f0", type=int, default=1)
