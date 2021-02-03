@@ -35,8 +35,8 @@ class ContinuousMomentum(torch.optim.Optimizer):
     d/dt parameters = velocity
     """
 
-    def __init__(self, params, dt, tau):
-        defaults = dict(dt=dt, tau=tau)
+    def __init__(self, params, dt, tau, weight_decay=0):
+        defaults = dict(dt=dt, tau=tau, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
     def step(self, closure=None):
@@ -53,6 +53,7 @@ class ContinuousMomentum(torch.optim.Optimizer):
         for group in self.param_groups:
             tau = group['tau']
             dt = group['dt']
+            weight_decay = group['weight_decay']
 
             for p in group['params']:
                 if p.grad is None:
@@ -79,6 +80,9 @@ class ContinuousMomentum(torch.optim.Optimizer):
                     v.mul_(x).add_(-(1 - x) * p.grad.data)
                 else:
                     v = -p.grad.data
+
+                if weight_decay != 0:
+                    v = v.add(-p, alpha=weight_decay)
 
                 p.data.add_(dt * v)
                 param_state['t'] += dt
@@ -113,11 +117,12 @@ def output_gradient(f, loss, x, y, out0, chunk):
     return torch.cat(out), grad
 
 
-def train_regular(f0, x, y, tau, loss, subf0, chunk, batch=None, max_dgrad=math.inf, max_dout=math.inf):
+def train_regular(f0, x, y, tau, loss, weight_decay, subf0, chunk, batch=None, max_dgrad=math.inf, max_dout=math.inf, f=None):
     if batch is None:
         batch = len(x)
 
-    f = copy.deepcopy(f0)
+    if f is None:
+        f = copy.deepcopy(f0)
 
     with torch.no_grad():
         with torch.no_grad():
@@ -132,7 +137,7 @@ def train_regular(f0, x, y, tau, loss, subf0, chunk, batch=None, max_dgrad=math.
     dt = 1
     current_dt = 0
     step_change_dt = 0
-    optimizer = ContinuousMomentum(f.parameters(), dt=dt, tau=tau)
+    optimizer = ContinuousMomentum(f.parameters(), dt=dt, tau=tau, weight_decay=weight_decay)
 
     t = 0
 
@@ -197,6 +202,44 @@ def train_regular(f0, x, y, tau, loss, subf0, chunk, batch=None, max_dgrad=math.
         else:
             bi = torch.randperm(len(x))[:batch].sort().values
             out, grad = output_gradient(f, loss, x[bi], y[bi], out0[bi], chunk)
+
+
+def train_regular_sgd(f0, x, y, tau, loss, subf0, lr, bs):
+    f = copy.deepcopy(f0)
+
+    with torch.no_grad():
+        with torch.no_grad():
+            out0 = f0(x)
+        if not subf0:
+            out0 = torch.zeros_like(out0)
+
+    optimizer = ContinuousMomentum(f.parameters(), dt=lr, tau=tau)
+
+    t = 0
+
+    out, grad = output_gradient(f, loss, x, y, out0, bs)
+
+    for step in itertools.count():
+
+        state = {
+            'step': step,
+            't': t,
+            'dt': lr,
+        }
+
+        yield state, f, out, out0, grad
+
+        if torch.isnan(out).any():
+            break
+
+        # make 1 step:
+
+        state = copy.deepcopy((f.state_dict(), optimizer.state_dict(), t))
+
+        make_step(f, optimizer, lr, grad)
+        t += lr
+
+        out, grad = output_gradient(f, loss, x, y, out0, bs)
 
 
 def train_kernel(ktrtr, ytr, tau, loss_prim, max_dgrad=math.inf, max_dout=math.inf):
