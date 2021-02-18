@@ -35,8 +35,8 @@ class ContinuousMomentum(torch.optim.Optimizer):
     d/dt parameters = velocity
     """
 
-    def __init__(self, params, dt, tau, weight_decay=0):
-        defaults = dict(dt=dt, tau=tau, weight_decay=weight_decay)
+    def __init__(self, params, params0, dt, tau, weight_decay=0):
+        defaults = dict(dt=dt, tau=tau, weight_decay=weight_decay, params0=params0)
         super().__init__(params, defaults)
 
     def step(self, closure=None):
@@ -55,7 +55,7 @@ class ContinuousMomentum(torch.optim.Optimizer):
             dt = group['dt']
             weight_decay = group['weight_decay']
 
-            for p in group['params']:
+            for p, p0 in zip(group['params'], group['params0']):
                 if p.grad is None:
                     continue
 
@@ -82,7 +82,7 @@ class ContinuousMomentum(torch.optim.Optimizer):
                     v = -p.grad.data
 
                 if weight_decay != 0:
-                    v = v.add(-p, alpha=weight_decay)
+                    v = v.add(-p + p0, alpha=weight_decay)
 
                 p.data.add_(dt * v)
                 param_state['t'] += dt
@@ -137,7 +137,7 @@ def train_regular(f0, x, y, tau, loss, weight_decay, subf0, chunk, batch=None, m
     dt = 1
     current_dt = 0
     step_change_dt = 0
-    optimizer = ContinuousMomentum(f.parameters(), dt=dt, tau=tau, weight_decay=weight_decay)
+    optimizer = ContinuousMomentum(f.parameters(), params0=f0.parameters(), dt=dt, tau=tau, weight_decay=weight_decay)
 
     t = 0
 
